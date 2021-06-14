@@ -1,3 +1,12 @@
+# Personal dev tools-related exclusions
+.DS_Store
+.idea
+rough
+
+# Data files
+datasets
+data/data
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -127,3 +136,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+notebooks/examples/data/
