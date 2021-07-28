@@ -1,7 +1,7 @@
 import logging
 
 from tqdm.auto import tqdm
-from hierarchical_pvi.servers import HPVIServer
+from hpvi.servers import HPVIServer
 
 logger = logging.getLogger(__name__)
 
