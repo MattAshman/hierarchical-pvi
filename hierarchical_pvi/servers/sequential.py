@@ -7,6 +7,14 @@ logger = logging.getLogger(__name__)
 
 
 class HPVISequentialServer(HPVIServer):
+
+    def get_default_config(self):
+        return {
+            **super().get_default_config(),
+            "init_q_always": False,
+            "init_q_to_all": False,
+        }
+
     def tick(self):
         if self.should_stop():
             return False
@@ -17,20 +25,30 @@ class HPVISequentialServer(HPVIServer):
                 logger.debug(f"On client {i + 1} of {len(self.clients)}.")
 
                 # Get q(θ_k).
-                q = self.compute_marginal(i)
-
-                if self.iterations == 0:
-                    # First iteration. Pass q_init(θ) to client.
-                    _, _ = client.fit(q, self.init_q)
+                q_i = self.compute_marginal(client_idx=i)
+                if (not self.config["init_q_to_all"] and self.communications
+                    == 0) or \
+                    (self.config["init_q_to_all"] and self.iterations == 0) \
+                        or self.config["init_q_always"]:
+                    # First iteratio. Pass q_init(θ) to client.
+                    _, _ = client.fit(q_i, self.init_q)
                 else:
-                    _, _ = client.fit(q)
+                    _, _ = client.fit(q_i)
 
                 logger.debug(
                     "Received client updates. Updating global posterior.")
 
                 # Update global posterior.
-                self.q = self.compute_marginal()
+                self.q_glob = self.compute_marginal(glob=True)
+                self.q = self.compute_marginal(loc=True)
+
                 self.communications += 1
+
+                # Evaluate performance after every posterior update for first
+                # iteration.
+                if self.iterations == 0:
+                    self.evaluate_performance()
+                    self.log["communications"].append(self.communications)
 
         logger.debug(f"Iteration {self.iterations} complete.\n")
         self.iterations += 1
