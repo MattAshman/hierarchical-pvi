@@ -8,16 +8,19 @@ class HPVIServer(Server):
     An base class for hierarchical PVI.
     """
     def __init__(self, data_model, param_model, p, clients, config=None,
-                 init_q=None, val_data=None):
+                 init_q=None, data=None, val_data=None):
         super().__init__(data_model, p, clients, config, init_q, val_data)
 
         self.param_model = param_model
         self.data_model = self.model
 
-        # Update current q based on initial client.ts.
-        self.q = self.compute_marginal()
+        # Update current q_glob and q_loc based on initial client.ts.
+        self.q_glob = self.compute_marginal(glob=True)
 
-    def compute_marginal(self, client_idx=None):
+        # self.q_loc is self.q.
+        self.q = self.compute_marginal(loc=True)
+
+    def compute_marginal(self, glob=False, loc=False, client_idx=None):
         """
         Computes the marginal distibution over local parameters θ_k or global
         parameters ɸ.
@@ -46,7 +49,7 @@ class HPVIServer(Server):
 
             # q_{\k}(ɸ) = p(ɸ) Π_{m≠k} ∫ p(θ_m|ɸ)t_m(θ_m) dθ_m.
             # TODO: assumes q(ɸ) has been computed correctly.
-            qphi_nps = self.q.nat_params
+            qphi_nps = self.q_glob.nat_params
             qphi_cav_np1 = qphi_nps["np1"] - tphi_np1
             qphi_cav_np2 = qphi_nps["np2"] - tphi_np2
             qphi_cav_var = -0.5 / qphi_cav_np2
@@ -65,7 +68,7 @@ class HPVIServer(Server):
 
             return q
 
-        else:
+        elif glob or loc:
             # q(ɸ) = p(ɸ) Π_m ∫ p(θ_m|ɸ)t_m(θ_m) dθ_m.
             p_nps = self.p.nat_params
             q_np1 = p_nps["np1"]
@@ -92,7 +95,21 @@ class HPVIServer(Server):
                 q_np1 += tphi_np1
                 q_np2 += tphi_np2
 
-            q_nps = {"np1": q_np1, "np2": q_np2}
-            q = self.q.create_new(nat_params=q_nps, is_trainable=False)
+            if glob:
+                q_nps = {"np1": q_np1, "np2": q_np2}
+            else:
+                q_var = -0.5 / q_np2
+                q_loc = -0.5 * q_np1 / q_np2
 
+                # q(θ) = ∫p(θ|ɸ)q(ɸ)dɸ.
+                q_var = q_var + self.param_model.outputsigma ** 2
+                q_loc = q_loc
+                q_np1 = q_loc * q_var ** -1
+                q_np2 = -0.5 * q_var ** -1
+                q_nps = {"np1": q_np1, "np2": q_np2}
+
+            q = self.q.create_new(nat_params=q_nps, is_trainable=False)
             return q
+
+        else:
+            return ValueError("Must specifiy either glob, loc or client_idx")
