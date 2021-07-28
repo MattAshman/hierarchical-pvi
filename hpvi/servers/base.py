@@ -1,3 +1,4 @@
+from collections import defaultdict
 import torch
 
 from pvi.servers.base import Server
@@ -28,11 +29,12 @@ class HPVIServer(Server):
             metrics = {**default_metrics, **metrics}
 
         if self.config["performance_metrics"] is not None:
+            perf_metrics = defaultdict(dict)
+
             train_metrics = self.config["performance_metrics"](
                 self, self.data, q=self.q
             )
-            metrics["q_server"] = {}
-            metrics["q_server"]["train_data"] = train_metrics
+            perf_metrics["q_server"]["train_data"] = train_metrics
 
             if self.val_data is not None:
                 # First get q_server performance on val data.
@@ -40,7 +42,7 @@ class HPVIServer(Server):
                     self, self.val_data, q=self.q
                 )
 
-                metrics["q_server"]["val_data"] = val_metrics
+                perf_metrics["q_server"]["val_data"] = val_metrics
 
                 # Now get each client's q_loc performance.
                 for i, client in enumerate(self.clients):
@@ -48,13 +50,13 @@ class HPVIServer(Server):
                     val_metrics = self.config["performance_metrics"](
                         self, self.val_data, q=q_i_server
                     )
-                    metrics["q_i_server"]["val_data"] = val_metrics
+                    perf_metrics[f"q_{i}_server"]["val_data"] = val_metrics
 
                     q_i_client = client.q
                     val_metrics = self.config["performance_metrics"](
                         self, self.val_data, q=q_i_client
                     )
-                    metrics["q_i_client"]["val_data"] = val_metrics
+                    perf_metrics[f"q_{i}_client"]["val_data"] = val_metrics
 
             if self.clients_val_data is not None:
                 # Get performance on local validation data.
@@ -64,19 +66,21 @@ class HPVIServer(Server):
                     val_metrics = self.config["performance_metrics"](
                         self, val_data, q=self.q
                     )
-                    metrics["q_server"][f"client_{i}_val_data"] = val_metrics
+                    perf_metrics["q_server"][f"client_{i}_val_data"] = val_metrics
 
                     q_i_server = self.compute_marginal(client_idx=i)
                     val_metrics = self.config["performance_metrics"](
                         self, val_data, q=q_i_server
                     )
-                    metrics["q_i_server"][f"client_{i}_val_data"] = val_metrics
+                    perf_metrics[f"q_{i}_server"][f"client_{i}_val_data"] = val_metrics
 
                     q_i_client = client.q
                     val_metrics = self.config["performance_metrics"](
                         self, val_data, q=q_i_client
                     )
-                    metrics["q_i_client"][f"client_{i}_val_data"] = val_metrics
+                    perf_metrics[f"q_{i}_client"][f"client_{i}_val_data"] = val_metrics
+
+            metrics = {**metrics, **perf_metrics}
 
         if self.config["track_q"]:
             # Store current q(ɸ) natural parameters.
@@ -100,21 +104,19 @@ class HPVIServer(Server):
 
             # t(θ_k).
             t_nps = self.clients[client_idx].t.nat_params
+            non_zero_idx = torch.where(t_nps["np2"] != 0.0)[0]
 
-            # Useful to employ a matrix inversion identity here.
-            if torch.is_nonzero(sum(t_nps["np2"])):
-                t_var = -0.5 / t_nps["np2"]
-                t_loc = -0.5 * t_nps["np1"] / t_nps["np2"]
+            tphi_np1 = torch.zeros(*t_nps["np1"].shape).to(t_nps["np1"])
+            tphi_np2 = torch.zeros(*t_nps["np2"].shape).to(t_nps["np2"])
 
-                # t_k(ɸ) = ∫t(θ_k)p(θ_k | ɸ) dθ_k.
-                tphi_var = t_var + self.param_model.outputsigma ** 2
-                tphi_loc = t_loc
-                tphi_np1 = tphi_loc * tphi_var ** -1
-                tphi_np2 = -0.5 * tphi_var ** (-1)
+            t_var = -0.5 / t_nps["np2"][non_zero_idx]
+            t_loc = -0.5 * t_nps["np1"][non_zero_idx] / t_nps["np2"][non_zero_idx]
 
-            else:
-                tphi_np1 = torch.zeros_like(t_nps["np1"])
-                tphi_np2 = torch.zeros_like(t_nps["np2"])
+            # t_m(ɸ) = ∫t(θ_m)p(θ_m|ɸ) dθ_m.
+            tphi_var = t_var + self.param_model.outputsigma ** 2
+            tphi_loc = t_loc
+            tphi_np1[non_zero_idx] = tphi_loc * tphi_var ** -1
+            tphi_np2[non_zero_idx] = -0.5 * tphi_var ** -1
 
             # q_{\k}(ɸ) = p(ɸ) Π_{m≠k} ∫ p(θ_m|ɸ)t_m(θ_m) dθ_m.
             # TODO: assumes q(ɸ) has been computed correctly.
@@ -140,26 +142,25 @@ class HPVIServer(Server):
         if glob or loc:
             # q(ɸ) = p(ɸ) Π_m ∫ p(θ_m|ɸ)t_m(θ_m) dθ_m.
             p_nps = self.p.nat_params
-            q_np1 = p_nps["np1"]
-            q_np2 = p_nps["np2"]
+            q_np1 = p_nps["np1"].clone()
+            q_np2 = p_nps["np2"].clone()
 
             for client in self.clients:
                 # t(θ_m).
                 t_nps = client.t.nat_params
+                non_zero_idx = torch.where(t_nps["np2"] != 0.0)[0]
 
-                if torch.is_nonzero(sum(t_nps["np2"])):
-                    t_var = -0.5 / t_nps["np2"]
-                    t_loc = -0.5 * t_nps["np1"] / t_nps["np2"]
+                tphi_np1 = torch.zeros(*t_nps["np1"].shape).to(t_nps["np1"])
+                tphi_np2 = torch.zeros(*t_nps["np2"].shape).to(t_nps["np2"])
 
-                    # t_m(ɸ) = ∫t(θ_m)p(θ_m|ɸ) dθ_m.
-                    tphi_var = t_var + self.param_model.outputsigma ** 2
-                    tphi_loc = t_loc
-                    tphi_np1 = tphi_loc * tphi_var ** -1
-                    tphi_np2 = -0.5 * tphi_var ** (-1)
+                t_var = -0.5 / t_nps["np2"][non_zero_idx]
+                t_loc = -0.5 * t_nps["np1"][non_zero_idx] / t_nps["np2"][non_zero_idx]
 
-                else:
-                    tphi_np1 = torch.zeros_like(t_nps["np1"])
-                    tphi_np2 = torch.zeros_like(t_nps["np2"])
+                # t_m(ɸ) = ∫t(θ_m)p(θ_m|ɸ) dθ_m.
+                tphi_var = t_var + self.param_model.outputsigma ** 2
+                tphi_loc = t_loc
+                tphi_np1[non_zero_idx] = tphi_loc * tphi_var ** -1
+                tphi_np2[non_zero_idx] = -0.5 * tphi_var ** -1
 
                 q_np1 += tphi_np1
                 q_np2 += tphi_np2
