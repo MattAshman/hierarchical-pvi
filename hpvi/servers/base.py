@@ -7,18 +7,87 @@ class HPVIServer(Server):
     """
     An base class for hierarchical PVI.
     """
-    def __init__(self, data_model, param_model, p, clients, config=None,
-                 init_q=None, data=None, val_data=None):
-        super().__init__(data_model, p, clients, config, init_q, val_data)
+
+    def __init__(self, param_model, clients_val_data=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
         self.param_model = param_model
-        self.data_model = self.model
+        self.clients_val_data = clients_val_data
 
         # Update current q_glob and q_loc based on initial client.ts.
         self.q_glob = self.compute_marginal(glob=True)
-
-        # self.q_loc is self.q.
         self.q = self.compute_marginal(loc=True)
+
+    def evaluate_performance(self, default_metrics=None):
+        metrics = {
+            "communications": self.communications,
+            "iterations": self.iterations,
+        }
+
+        if default_metrics is not None:
+            metrics = {**default_metrics, **metrics}
+
+        if self.config["performance_metrics"] is not None:
+            train_metrics = self.config["performance_metrics"](
+                self, self.data, q=self.q
+            )
+            metrics["q_server"] = {}
+            metrics["q_server"]["train_data"] = train_metrics
+
+            if self.val_data is not None:
+                # First get q_server performance on val data.
+                val_metrics = self.config["performance_metrics"](
+                    self, self.val_data, q=self.q
+                )
+
+                metrics["q_server"]["val_data"] = val_metrics
+
+                # Now get each client's q_loc performance.
+                for i, client in enumerate(self.clients):
+                    q_i_server = self.compute_marginal(client_idx=i)
+                    val_metrics = self.config["performance_metrics"](
+                        self, self.val_data, q=q_i_server
+                    )
+                    metrics["q_i_server"]["val_data"] = val_metrics
+
+                    q_i_client = client.q
+                    val_metrics = self.config["performance_metrics"](
+                        self, self.val_data, q=q_i_client
+                    )
+                    metrics["q_i_client"]["val_data"] = val_metrics
+
+            if self.clients_val_data is not None:
+                # Get performance on local validation data.
+                for i, (client, val_data) in enumerate(
+                    zip(self.clients, self.clients_val_data)
+                ):
+                    val_metrics = self.config["performance_metrics"](
+                        self, val_data, q=self.q
+                    )
+                    metrics["q_server"][f"client_{i}_val_data"] = val_metrics
+
+                    q_i_server = self.compute_marginal(client_idx=i)
+                    val_metrics = self.config["performance_metrics"](
+                        self, val_data, q=q_i_server
+                    )
+                    metrics["q_i_server"][f"client_{i}_val_data"] = val_metrics
+
+                    q_i_client = client.q
+                    val_metrics = self.config["performance_metrics"](
+                        self, val_data, q=q_i_client
+                    )
+                    metrics["q_i_client"][f"client_{i}_val_data"] = val_metrics
+
+        if self.config["track_q"]:
+            # Store current q(ɸ) natural parameters.
+            metrics["npq_phi"] = {
+                k: v.detach().cpu() for k, v in self.q_glob.nat_params.items()
+            }
+            metrics["npq_theta"] = {
+                k: v.detach().cpu() for k, v in self.q.nat_params.items()
+            }
+
+        self.log["performance_metrics"].append(metrics)
 
     def compute_marginal(self, glob=False, loc=False, client_idx=None):
         """
@@ -68,7 +137,7 @@ class HPVIServer(Server):
 
             return q
 
-        elif glob or loc:
+        if glob or loc:
             # q(ɸ) = p(ɸ) Π_m ∫ p(θ_m|ɸ)t_m(θ_m) dθ_m.
             p_nps = self.p.nat_params
             q_np1 = p_nps["np1"]

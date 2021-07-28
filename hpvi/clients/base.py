@@ -14,10 +14,12 @@ logger = logging.getLogger(__name__)
 # Client class
 # =============================================================================
 
+
 class HPVIClient(Client):
     """
     The same as Client, excepts retains a self.loc_val_data.
     """
+
     def __init__(self, loc_val_data=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -30,7 +32,8 @@ class HPVIClient(Client):
         if self.config["performance_metrics"] is not None:
             if self.loc_val_data is not None:
                 loc_val_metrics = self.config["performance_metrics"](
-                    self, self.loc_val_data)
+                    self, self.loc_val_data
+                )
                 for k, v in loc_val_metrics.items():
                     metrics["loc_val_" + k] = v
 
@@ -45,8 +48,17 @@ class HPVIClientJoint(Client):
 
     of the hierarchical model p(ɸ) Π p(θ|ɸ) p(y | θ).
     """
-    def __init__(self, data, data_model, param_model, t=None, q_loc=None,
-                 config=None, val_data=None):
+
+    def __init__(
+        self,
+        data,
+        data_model,
+        param_model,
+        t=None,
+        q_loc=None,
+        config=None,
+        val_data=None,
+    ):
 
         super().__init__(data, data_model, t, config, val_data)
 
@@ -63,8 +75,7 @@ class HPVIClientJoint(Client):
         """
 
         # Pass a trainable copy to optimise.
-        q_glob, self.t, self.q = self.gradient_based_update(
-            p=q, init_q=init_q)
+        q_glob, self.t, self.q = self.gradient_based_update(p=q, init_q=init_q)
 
         # Only return new q and approximate likelihood term. Server doesn't
         # need to know about local model.
@@ -80,8 +91,9 @@ class HPVIClientJoint(Client):
 
         if self.t is not None:
             # TODO: check if valid distribution.
-            q_cav.nat_params = {k: v - self.t.nat_params[k]
-                                for k, v in q_cav.nat_params.items()}
+            q_cav.nat_params = {
+                k: v - self.t.nat_params[k] for k, v in q_cav.nat_params.items()
+            }
 
         if init_q is not None:
             q = init_q.trainable_copy()
@@ -103,31 +115,31 @@ class HPVIClientJoint(Client):
             parameters = [
                 {"params": q_parameters},
                 {"params": q_loc_parameters},
-                {"params": self.data_model.parameters(),
-                 **self.config["model_optimiser_params"]}
+                {
+                    "params": self.data_model.parameters(),
+                    **self.config["model_optimiser_params"],
+                },
             ]
         else:
-            parameters = [
-                {"params": q_parameters},
-                {"params": q_loc_parameters}
-            ]
+            parameters = [{"params": q_parameters}, {"params": q_loc_parameters}]
 
         # Reset optimiser.
         logging.info("Resetting optimiser")
         optimiser = getattr(torch.optim, self.config["optimiser"])(
-            parameters, **self.config["optimiser_params"])
-        lr_scheduler = getattr(torch.optim.lr_scheduler,
-                               self.config["lr_scheduler"])(
-            optimiser, **self.config["lr_scheduler_params"])
+            parameters, **self.config["optimiser_params"]
+        )
+        lr_scheduler = getattr(torch.optim.lr_scheduler, self.config["lr_scheduler"])(
+            optimiser, **self.config["lr_scheduler_params"]
+        )
 
         # Set up data
         x = self.data["x"]
         y = self.data["y"]
 
         tensor_dataset = TensorDataset(x, y)
-        loader = DataLoader(tensor_dataset,
-                            batch_size=self.config["batch_size"],
-                            shuffle=True)
+        loader = DataLoader(
+            tensor_dataset, batch_size=self.config["batch_size"], shuffle=True
+        )
 
         if self.config["device"] == "cuda":
             loader.pin_memory = True
@@ -140,15 +152,19 @@ class HPVIClientJoint(Client):
 
         # Reset early stopping.
         self.config["early_stopping"](
-            scores=None,
-            model=[q.non_trainable_copy(), q_loc.non_trainable_copy()])
+            scores=None, model=[q.non_trainable_copy(), q_loc.non_trainable_copy()]
+        )
 
         # Gradient-based optimisation loop -- loop over epochs.
-        epoch_iter = tqdm(range(self.config["epochs"]), desc="Epoch",
-                          leave=True, disable=(not self.config["verbose"]))
+        epoch_iter = tqdm(
+            range(self.config["epochs"]),
+            desc="Epoch",
+            leave=True,
+            disable=(not self.config["verbose"]),
+        )
         # for i in range(self.config["epochs"]):
         for i in epoch_iter:
-            epoch = defaultdict(lambda: 0.)
+            epoch = defaultdict(lambda: 0.0)
 
             # Loop over batches in current epoch
             for (x_batch, y_batch) in iter(loader):
@@ -186,26 +202,30 @@ class HPVIClientJoint(Client):
                 npq = torch.cat([np for np in q_loc.nat_params.values()])
                 mq = torch.cat([mp for mp in q_loc.mean_params.values()])
                 log_aq = q_loc.log_a()
-                enpp = torch.cat([q.std_params["loc"] / sigma ** 2,
-                                 torch.ones_like(q.std_params["loc"])
-                                 * (- 1 / (2 * sigma ** 2))])
-                elog_ap = (q.std_params["loc"] ** 2
-                           + q.std_params["scale"] ** 2) / (2 * sigma ** 2)
+                enpp = torch.cat(
+                    [
+                        q.std_params["loc"] / sigma ** 2,
+                        torch.ones_like(q.std_params["loc"]) * (-1 / (2 * sigma ** 2)),
+                    ]
+                )
+                elog_ap = (q.std_params["loc"] ** 2 + q.std_params["scale"] ** 2) / (
+                    2 * sigma ** 2
+                )
                 elog_ap += torch.log(sigma)
-                elog_ap = (elog_ap.sum()
-                           - 0.5 * np.log(np.pi) * len(q.std_params["loc"]))
+                elog_ap = elog_ap.sum() - 0.5 * np.log(np.pi) * len(q.std_params["loc"])
                 kl_loc = (npq - enpp).dot(mq) - log_aq + elog_ap
                 kl_loc /= len(x)
 
                 # Sample θ from q(θ) and compute p(y | θ, x) for each θ
                 ll = self.data_model.expected_log_likelihood(
-                    batch, q_loc, self.config["num_elbo_samples"]).sum()
+                    batch, q_loc, self.config["num_elbo_samples"]
+                ).sum()
                 ll /= len(x_batch)
 
                 # Compute E_q[log t(θ)].
                 # logt = self.t.eqlogt(q, self.config["num_elbo_samples"])
                 # logt /= len(x)
-                logt = torch.tensor(0.).to(self.config["device"])
+                logt = torch.tensor(0.0).to(self.config["device"])
 
                 loss = kl + kl_loc - ll
                 loss.backward()
@@ -218,8 +238,12 @@ class HPVIClientJoint(Client):
                 epoch["ll"] += ll.item() / len(loader)
                 epoch["logt"] += logt.item() / len(loader)
 
-            epoch_iter.set_postfix(elbo=epoch["elbo"], kl=epoch["kl"],
-                                   kl_loc=epoch["kl_loc"], ll=epoch["ll"])
+            epoch_iter.set_postfix(
+                elbo=epoch["elbo"],
+                kl=epoch["kl"],
+                kl_loc=epoch["kl_loc"],
+                ll=epoch["ll"],
+            )
 
             # Log progress for current epoch.
             training_metrics["elbo"].append(epoch["elbo"])
@@ -233,21 +257,26 @@ class HPVIClientJoint(Client):
             # Check whether to stop early.
             stop_early = self.config["early_stopping"](
                 scores=training_metrics,
-                model=[q.non_trainable_copy(),
-                       q_loc.non_trainable_copy()])
+                model=[q.non_trainable_copy(), q_loc.non_trainable_copy()],
+            )
 
-            if (i > 0 and i % self.config["print_epochs"] == 0) \
-                    or i == (self.config["epochs"] - 1) or stop_early:
+            if (
+                (i > 0 and i % self.config["print_epochs"] == 0)
+                or i == (self.config["epochs"] - 1)
+                or stop_early
+            ):
                 # Update global posterior before evaluating performance.
                 self.q = q_loc.non_trainable_copy()
 
-                metrics = self.evaluate_performance({
-                    "epochs": i,
-                    "elbo": epoch["elbo"],
-                    "kl": epoch["kl"],
-                    "kl_loc": epoch["kl_loc"],
-                    "ll": epoch["ll"],
-                })
+                metrics = self.evaluate_performance(
+                    {
+                        "epochs": i,
+                        "elbo": epoch["elbo"],
+                        "kl": epoch["kl"],
+                        "kl_loc": epoch["kl_loc"],
+                        "ll": epoch["ll"],
+                    }
+                )
 
                 # Report performance.
                 report = ""
@@ -281,9 +310,12 @@ class HPVIClientJoint(Client):
         if self.t is not None:
             # Compute new local contribution from old distributions
             t_new = self.t.compute_refined_factor(
-                q_new, q_old, damping=self.config["damping_factor"],
+                q_new,
+                q_old,
+                damping=self.config["damping_factor"],
                 valid_dist=self.config["valid_factors"],
-                update_log_coeff=self.config["update_log_coeff"])
+                update_log_coeff=self.config["update_log_coeff"],
+            )
 
             return q_new, t_new, q_loc_new
 
@@ -310,8 +342,17 @@ class HPVIClientIndependent(Client):
     where q_cav(ɸ) excludes the clients factor (as to not count the data twice)
     and the mixture ∫ q_cav(ɸ) p(θ|ɸ) dɸ is used as the prior.
     """
-    def __init__(self, data, data_model, param_model, t=None, q_loc=None,
-                 config=None, val_data=None):
+
+    def __init__(
+        self,
+        data,
+        data_model,
+        param_model,
+        t=None,
+        q_loc=None,
+        config=None,
+        val_data=None,
+    ):
 
         super().__init__(data, data_model, t, config, val_data)
 
@@ -332,8 +373,7 @@ class HPVIClientIndependent(Client):
         q_loc = self.local_gradient_based_update(q_glob=q)
 
         # Find new global contribution.
-        q_new, self.t = self.gradient_based_update(
-            p=q, init_q=init_q)
+        q_new, self.t = self.gradient_based_update(p=q, init_q=init_q)
 
         self.q = q_loc
 
@@ -347,8 +387,9 @@ class HPVIClientIndependent(Client):
 
         # Compute cavity.
         q_cav = q_glob.non_trainable_copy()
-        q_cav.nat_params = {k: v - self.t.nat_params[k]
-                            for k, v in q_cav.nat_params.items()}
+        q_cav.nat_params = {
+            k: v - self.t.nat_params[k] for k, v in q_cav.nat_params.items()
+        }
 
         # In the case of Gaussians, can compute p(θ) = ∫ q(ɸ) p(θ | ɸ) dɸ in
         # closed-form.
@@ -356,13 +397,13 @@ class HPVIClientIndependent(Client):
         p_loc_std_params = {
             "loc": q_cav.std_params["loc"],
             "scale": (
-                q_cav.std_params["scale"] ** 2
-                + self.param_model.outputsigma ** 2) ** 0.5
+                q_cav.std_params["scale"] ** 2 + self.param_model.outputsigma ** 2
+            )
+            ** 0.5,
         }
 
         # TODO: which to use?
-        p_loc = q_cav.create_new(std_params=p_loc_std_params,
-                                 is_trainable=False)
+        p_loc = q_cav.create_new(std_params=p_loc_std_params, is_trainable=False)
         # p_loc = q_glob.non_trainable_copy()
 
         if self.q is None:
@@ -377,19 +418,20 @@ class HPVIClientIndependent(Client):
         # Reset optimiser.
         logging.info("Resetting optimiser")
         optimiser = getattr(torch.optim, self.config["optimiser"])(
-            parameters, **self.config["optimiser_params"])
-        lr_scheduler = getattr(torch.optim.lr_scheduler,
-                               self.config["lr_scheduler"])(
-            optimiser, **self.config["lr_scheduler_params"])
+            parameters, **self.config["optimiser_params"]
+        )
+        lr_scheduler = getattr(torch.optim.lr_scheduler, self.config["lr_scheduler"])(
+            optimiser, **self.config["lr_scheduler_params"]
+        )
 
         # Set up data
         x = self.data["x"]
         y = self.data["y"]
 
         tensor_dataset = TensorDataset(x, y)
-        loader = DataLoader(tensor_dataset,
-                            batch_size=self.config["batch_size"],
-                            shuffle=True)
+        loader = DataLoader(
+            tensor_dataset, batch_size=self.config["batch_size"], shuffle=True
+        )
 
         if self.config["device"] == "cuda":
             loader.pin_memory = True
@@ -404,12 +446,16 @@ class HPVIClientIndependent(Client):
         self.config["early_stopping"](None, q_loc.non_trainable_copy())
 
         # Gradient-based optimisation loop -- loop over epochs.
-        epoch_iter = tqdm(range(self.config["epochs"]), desc="Epoch",
-                          leave=True, disable=(not self.config["verbose"]))
+        epoch_iter = tqdm(
+            range(self.config["epochs"]),
+            desc="Epoch",
+            leave=True,
+            disable=(not self.config["verbose"]),
+        )
 
         # for i in range(self.config["epochs"]):
         for i in epoch_iter:
-            epoch = defaultdict(lambda: 0.)
+            epoch = defaultdict(lambda: 0.0)
 
             # Loop over batches in current epoch
             for (x_batch, y_batch) in iter(loader):
@@ -430,7 +476,8 @@ class HPVIClientIndependent(Client):
 
                 # Sample θ from q(θ) and compute p(y | θ) for each θ
                 ll = self.data_model.expected_log_likelihood(
-                    batch, q_loc, self.config["num_elbo_samples"]).sum()
+                    batch, q_loc, self.config["num_elbo_samples"]
+                ).sum()
                 ll /= len(x_batch)
 
                 loss = kl - ll
@@ -442,8 +489,7 @@ class HPVIClientIndependent(Client):
                 epoch["kl"] += kl.item() / len(loader)
                 epoch["ll"] += ll.item() / len(loader)
 
-            epoch_iter.set_postfix(elbo=epoch["elbo"], kl=epoch["kl"],
-                                   ll=epoch["ll"])
+            epoch_iter.set_postfix(elbo=epoch["elbo"], kl=epoch["kl"], ll=epoch["ll"])
 
             # Log progress for current epoch.
             training_metrics["elbo"].append(epoch["elbo"])
@@ -452,19 +498,25 @@ class HPVIClientIndependent(Client):
 
             # Check whether to stop early.
             stop_early = self.config["early_stopping"](
-                training_metrics, q_loc.non_trainable_copy())
+                training_metrics, q_loc.non_trainable_copy()
+            )
 
-            if (i > 0 and i % self.config["print_epochs"] == 0) \
-                    or i == (self.config["epochs"] - 1) or stop_early:
+            if (
+                (i > 0 and i % self.config["print_epochs"] == 0)
+                or i == (self.config["epochs"] - 1)
+                or stop_early
+            ):
                 # Update global posterior before evaluating performance.
                 self.q = q_loc.non_trainable_copy()
 
-                metrics = self.evaluate_performance({
-                    "epochs": i,
-                    "elbo": epoch["elbo"],
-                    "kl": epoch["kl"],
-                    "ll": epoch["ll"],
-                })
+                metrics = self.evaluate_performance(
+                    {
+                        "epochs": i,
+                        "elbo": epoch["elbo"],
+                        "kl": epoch["kl"],
+                        "ll": epoch["ll"],
+                    }
+                )
 
                 # Report performance.
                 report = ""
