@@ -339,7 +339,8 @@ class HPVIClientIndependent(Client):
         }
 
         # TODO: which to use?
-        p_loc = q_cav.create_new(std_params=p_loc_std_params, is_trainable=False)
+        p_loc = q_cav.create_new(std_params=p_loc_std_params,
+                                 is_trainable=False)
         # p_loc = q_glob.non_trainable_copy()
 
         if self.q is None:
@@ -445,9 +446,14 @@ class HPVIClientIndependent(Client):
 
                 # Report performance.
                 report = ""
+                report += f"epochs: {metrics['epochs']} "
+                report += f"elbo: {metrics['elbo']:.3f} "
+                report += f"ll: {metrics['ll']:.3f} "
+                report += f"kl: {metrics['kl']:.3f} \n"
                 for k, v in metrics.items():
-                    report += f"{k}: {v:.3f} "
                     performance_metrics[k].append(v)
+                    if "mll" in k or "acc" in k:
+                        report += f"{k}: {v:.3f} "
 
                 tqdm.write(report)
 
