@@ -14,6 +14,28 @@ logger = logging.getLogger(__name__)
 # Client class
 # =============================================================================
 
+class HPVIClient(Client):
+    """
+    The same as Client, excepts retains a self.loc_val_data.
+    """
+    def __init__(self, loc_val_data=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Local validation dataset.
+        self.loc_val_data = loc_val_data
+
+    def evaluate_performance(self, default_metrics=None):
+        metrics = super().evaluate_performance(default_metrics)
+
+        if self.config["performance_metrics"] is not None:
+            if self.loc_val_data is not None:
+                loc_val_metrics = self.config["performance_metrics"](
+                    self, self.loc_val_data)
+                for k, v in loc_val_metrics.items():
+                    metrics["loc_val_" + k] = v
+
+        return metrics
+
 
 class HPVIClientJoint(Client):
     """
