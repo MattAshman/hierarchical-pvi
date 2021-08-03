@@ -1,4 +1,5 @@
 from collections import defaultdict
+import time
 import torch
 
 from pvi.servers.base import Server
@@ -21,6 +22,9 @@ class HPVIServer(Server):
 
     def evaluate_performance(self, default_metrics=None):
         metrics = {
+            "time": time.time() - self.t0,
+            "perf_counter": time.perf_counter() - self.pc0,
+            "process_time": time.process_time() - self.pt0,
             "communications": self.communications,
             "iterations": self.iterations,
         }
