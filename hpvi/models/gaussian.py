@@ -18,10 +18,10 @@ class GaussianNoise(Model, nn.Module):
         self.train_sigma = train_sigma
         if self.train_sigma:
             self.register_parameter("log_outputsigma", nn.Parameter(
-                torch.tensor(self.hyperparameters["outputsigma"]).log(),
+                torch.as_tensor(self.hyperparameters["outputsigma"]).log(),
                 requires_grad=True))
         else:
-            self.register_buffer("log_outputsigma", torch.tensor(
+            self.register_buffer("log_outputsigma", torch.as_tensor(
                 self.hyperparameters["outputsigma"]).log())
 
         # Set ε after model is constructed.
