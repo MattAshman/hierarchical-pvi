@@ -97,6 +97,11 @@ class HPVIServer(Server):
 
         self.log["performance_metrics"].append(metrics)
 
+        # Reset timers.
+        self.t0 = time.time()
+        self.pc0 = time.perf_counter()
+        self.pt0 = time.process_time()
+
     def compute_marginal(self, glob=False, loc=False, client_idx=None):
         """
         Computes the marginal distibution over local parameters θ_k or global
