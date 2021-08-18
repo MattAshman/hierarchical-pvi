@@ -219,7 +219,15 @@ class HPVIClientBayesianHypers(Client):
                     # Sample and set hyperparameters of parameter model.
                     alpha = qa.rsample()
                     self.param_model.hyperparameters = alpha
+                    # phi = qphi.rsample()
 
+                    # sigma = self.param_model.outputsigma
+                    # ptheta_phi = qtheta.non_trainable_copy()
+                    # ptheta_phi.std_params = {
+                    #    "loc": phi,
+                    #    "scale": torch.ones_like(phi) * sigma,
+                    # }
+                    # kltheta += qtheta.kl_divergence(ptheta_phi).sum()
                     # Compute E_{q(ɸ)}[KL(q(θ)||p(θ|ɸ,𝛼))] in closed-form.
                     # KL(q(θ) | p(θ | ɸ))
                     #   = (η_q - η_p) ^ T E_q[f(θ)] - A(η_q) + A(η_p).
@@ -384,7 +392,7 @@ class HPVIClientBayesianHypers(Client):
             return qphi_new, qtheta_new, qa_new, None, None
 
 
-class HPVIClientJoint(Client):
+class MFHPVIClient(Client):
     """
     Learns a contribution t(ɸ) g(θ) to an approximation to the posterior,
 
@@ -396,21 +404,21 @@ class HPVIClientJoint(Client):
     def __init__(
         self,
         data,
-        data_model,
+        model,
         param_model,
-        t=None,
-        q_loc=None,
+        tphi=None,
+        qtheta=None,
         config=None,
         val_data=None,
+        loc_val_data=None,
     ):
 
-        super().__init__(data, data_model, t, config, val_data)
+        super().__init__(data, model, tphi, config, val_data)
 
         self.param_model = param_model
-        self.data_model = self.model
 
         # q(θ_k).
-        self.q = q_loc
+        self.q = qtheta
 
     def update_q(self, q, init_q=None):
         """
@@ -419,53 +427,57 @@ class HPVIClientJoint(Client):
         """
 
         # Pass a trainable copy to optimise.
-        q_glob, self.t, self.q = self.gradient_based_update(p=q, init_q=init_q)
+        qphi, self.q, self.t = self.gradient_based_update(p=q, init_q=init_q)
 
         # Only return new q and approximate likelihood term. Server doesn't
         # need to know about local model.
-        return q_glob, self.t
+        return qphi, self.t
 
     def gradient_based_update(self, p, init_q=None):
         # Cannot update during optimisation.
         self._can_update = False
 
         # Copy the approximate posterior, make non-trainable.
-        q_old = p.non_trainable_copy()
-        q_cav = p.non_trainable_copy()
+        qphi_old = p.non_trainable_copy()
+        qphi_cav = p.non_trainable_copy()
+
+        if self.q is None:
+            # Set equal to prior for q(ɸ).
+            qtheta_old = p.non_trainable_copy()
+        else:
+            qtheta_old = self.q.non_trainable_copy()
 
         if self.t is not None:
             # TODO: check if valid distribution.
-            q_cav.nat_params = {
-                k: v - self.t.nat_params[k] for k, v in q_cav.nat_params.items()
-            }
+            qphi_cav = qphi_cav.replace_factor(self.t, None)
 
         if init_q is not None:
-            q = init_q.trainable_copy()
+            qphi = init_q.trainable_copy()
+            qtheta = init_q.trainable_copy()
         else:
             # Initialise to prior.
-            q = p.trainable_copy()
+            qphi = p.trainable_copy()
 
-        if self.q is None:
-            # Initialise to q(ɸ).
-            q_loc = p.trainable_copy()
-        else:
-            q_loc = self.q.trainable_copy()
+            if self.q is None:
+                qtheta = qphi.trainable_copy()
+            else:
+                qtheta = self.q.trainable_copy()
 
         # TODO: currently assumes Gaussian distribution.
         # Parameters are those of q(ɸ), q(θ) and self.model.
-        q_parameters = list(q.parameters())
-        q_loc_parameters = list(q_loc.parameters())
+        qphi_parameters = list(qphi.parameters())
+        qtheta_parameters = list(qtheta.parameters())
         if self.config["train_model"]:
             parameters = [
-                {"params": q_parameters},
-                {"params": q_loc_parameters},
+                {"params": qphi_parameters},
+                {"params": qtheta_parameters},
                 {
-                    "params": self.data_model.parameters(),
+                    "params": self.model.parameters(),
                     **self.config["model_optimiser_params"],
                 },
             ]
         else:
-            parameters = [{"params": q_parameters}, {"params": q_loc_parameters}]
+            parameters = [{"params": qphi_parameters}, {"params": qtheta_parameters}]
 
         # Reset optimiser.
         logging.info("Resetting optimiser")
@@ -496,7 +508,7 @@ class HPVIClientJoint(Client):
 
         # Reset early stopping.
         self.config["early_stopping"](
-            scores=None, model=[q.non_trainable_copy(), q_loc.non_trainable_copy()]
+            scores=None, model=[qphi.non_trainable_copy(), qtheta.non_trainable_copy()]
         )
 
         # Gradient-based optimisation loop -- loop over epochs.
@@ -524,7 +536,7 @@ class HPVIClientJoint(Client):
 
                 # Compute the KL divergence between q(ɸ) and q_cav(ɸ), ignoring
                 # A(η_cav).
-                kl = q.kl_divergence(q_cav, calc_log_ap=False).sum() / len(x)
+                klphi = qphi.kl_divergence(qphi_cav, calc_log_ap=False).sum() / len(x)
 
                 # Estimate KL divergence E_{q(ɸ)}[KL(q(θ) || p(θ | ɸ))].
                 # phis = q.rsample((self.config["num_elbo_samples"],))
@@ -533,7 +545,7 @@ class HPVIClientJoint(Client):
                 #     p_loc = self.param_model.likelihood_forward(
                 #         phi, theta=None)
                 #     kl_loc += torch.distributions.kl_divergence(
-                #         q_loc.distribution, p_loc).sum() / len(x)
+                #         qtheta.distribution, p_loc).sum() / len(x)
                 #
                 # kl_loc /= self.config["num_elbo_samples"]
 
@@ -543,26 +555,29 @@ class HPVIClientJoint(Client):
                 # E_ɸ[KL(q(θ) | p(θ))]
                 #   = (η_q - E_ɸ[η_p]) ^ T E_q[f(θ)] - A(η_q) + E_ɸ[A(η_p)].
                 sigma = self.param_model.outputsigma
-                npq = torch.cat([np for np in q_loc.nat_params.values()])
-                mq = torch.cat([mp for mp in q_loc.mean_params.values()])
-                log_aq = q_loc.log_a()
+                npq = torch.cat([np for np in qtheta.nat_params.values()])
+                mq = torch.cat([mp for mp in qtheta.mean_params.values()])
+                log_aq = qtheta.log_a()
                 enpp = torch.cat(
                     [
-                        q.std_params["loc"] / sigma ** 2,
-                        torch.ones_like(q.std_params["loc"]) * (-1 / (2 * sigma ** 2)),
+                        qphi.std_params["loc"] / sigma ** 2,
+                        torch.ones_like(qphi.std_params["loc"])
+                        * (-1 / (2 * sigma ** 2)),
                     ]
                 )
-                elog_ap = (q.std_params["loc"] ** 2 + q.std_params["scale"] ** 2) / (
-                    2 * sigma ** 2
-                )
+                elog_ap = (
+                    qphi.std_params["loc"] ** 2 + qphi.std_params["scale"] ** 2
+                ) / (2 * sigma ** 2)
                 elog_ap += torch.log(sigma)
-                elog_ap = elog_ap.sum() - 0.5 * np.log(np.pi) * len(q.std_params["loc"])
-                kl_loc = (npq - enpp).dot(mq) - log_aq + elog_ap
-                kl_loc /= len(x)
+                elog_ap = elog_ap.sum() - 0.5 * np.log(np.pi) * len(
+                    qphi.std_params["loc"]
+                )
+                kltheta = (npq - enpp).dot(mq) - log_aq + elog_ap
+                kltheta /= len(x)
 
                 # Sample θ from q(θ) and compute p(y | θ, x) for each θ
-                ll = self.data_model.expected_log_likelihood(
-                    batch, q_loc, self.config["num_elbo_samples"]
+                ll = self.model.expected_log_likelihood(
+                    batch, qtheta, self.config["num_elbo_samples"]
                 ).sum()
                 ll /= len(x_batch)
 
@@ -571,28 +586,28 @@ class HPVIClientJoint(Client):
                 # logt /= len(x)
                 logt = torch.tensor(0.0).to(self.config["device"])
 
-                loss = kl + kl_loc - ll
+                loss = klphi + kltheta - ll
                 loss.backward()
                 optimiser.step()
 
                 # Keep track of quantities for current batch.
                 epoch["elbo"] += -loss.item() / len(loader)
-                epoch["kl"] += kl.item() / len(loader)
-                epoch["kl_loc"] += kl_loc.item() / len(loader)
+                epoch["klphi"] += klphi.item() / len(loader)
+                epoch["kltheta"] += kltheta.item() / len(loader)
                 epoch["ll"] += ll.item() / len(loader)
                 epoch["logt"] += logt.item() / len(loader)
 
             epoch_iter.set_postfix(
                 elbo=epoch["elbo"],
-                kl=epoch["kl"],
-                kl_loc=epoch["kl_loc"],
+                klphi=epoch["klphi"],
+                kltheta=epoch["kltheta"],
                 ll=epoch["ll"],
             )
 
             # Log progress for current epoch.
             training_metrics["elbo"].append(epoch["elbo"])
-            training_metrics["kl"].append(epoch["kl"])
-            training_metrics["kl_loc"].append(epoch["kl_loc"])
+            training_metrics["klphi"].append(epoch["klphi"])
+            training_metrics["kltheta"].append(epoch["kltheta"])
             training_metrics["ll"].append(epoch["ll"])
 
             if self.t is not None:
@@ -601,7 +616,7 @@ class HPVIClientJoint(Client):
             # Check whether to stop early.
             stop_early = self.config["early_stopping"](
                 scores=training_metrics,
-                model=[q.non_trainable_copy(), q_loc.non_trainable_copy()],
+                model=[qphi.non_trainable_copy(), qtheta.non_trainable_copy()],
             )
 
             if (
@@ -610,23 +625,29 @@ class HPVIClientJoint(Client):
                 or stop_early
             ):
                 # Update global posterior before evaluating performance.
-                self.q = q_loc.non_trainable_copy()
+                self.q = qtheta.non_trainable_copy()
 
                 metrics = self.evaluate_performance(
                     {
                         "epochs": i,
                         "elbo": epoch["elbo"],
-                        "kl": epoch["kl"],
-                        "kl_loc": epoch["kl_loc"],
+                        "klphi": epoch["klphi"],
+                        "kltheta": epoch["kltheta"],
                         "ll": epoch["ll"],
                     }
                 )
 
                 # Report performance.
                 report = ""
+                report += f"epochs: {metrics['epochs']} "
+                report += f"elbo: {metrics['elbo']:.3f} "
+                report += f"ll: {metrics['ll']:.3f} "
+                report += f"klphi: {metrics['klphi']:.3f} "
+                report += f"kltheta: {metrics['kltheta']:.3f} \n"
                 for k, v in metrics.items():
-                    report += f"{k}: {v:.3f} "
                     performance_metrics[k].append(v)
+                    if "mll" in k or "acc" in k:
+                        report += f"{k}: {v:.3f} "
 
                 tqdm.write(report)
 
@@ -643,10 +664,10 @@ class HPVIClientJoint(Client):
 
         # Create non-trainable copy to send back to server.
         if self.config["early_stopping"].stash_model:
-            q_new, q_loc_new = self.config["early_stopping"].best_model
+            qphi_new, qtheta_new = self.config["early_stopping"].best_model
         else:
-            q_new = q.non_trainable_copy()
-            q_loc_new = q_loc.non_trainable_copy()
+            qphi_new = qphi.non_trainable_copy()
+            qtheta_new = qtheta.non_trainable_copy()
 
         # Finished optimisation, can now update.
         self._can_update = True
@@ -654,17 +675,27 @@ class HPVIClientJoint(Client):
         if self.t is not None:
             # Compute new local contribution from old distributions
             t_new = self.t.compute_refined_factor(
-                q_new,
-                q_old,
+                qphi_new,
+                qphi_old,
                 damping=self.config["damping_factor"],
                 valid_dist=self.config["valid_factors"],
                 update_log_coeff=self.config["update_log_coeff"],
             )
 
-            return q_new, t_new, q_loc_new
+            # Apply damping to qtheta_new.
+            qtheta_new_nps = {
+                k: v * self.config["damping_factor"]
+                + (1 - self.config["damping_factor"]) * qtheta_old.nat_params[k]
+                for k, v in qtheta_new.nat_params.items()
+            }
+            qtheta_new = qtheta_new.create_new(
+                nat_params=qtheta_new_nps, is_trainable=False
+            )
+
+            return qphi_new, qtheta_new, t_new
 
         else:
-            return q_new, None, q_loc_new
+            return qphi_new, qtheta_new, None
 
 
 class HPVIClientIndependent(Client):
@@ -690,21 +721,21 @@ class HPVIClientIndependent(Client):
     def __init__(
         self,
         data,
-        data_model,
+        model,
         param_model,
         t=None,
-        q_loc=None,
+        qtheta=None,
         config=None,
         val_data=None,
     ):
 
-        super().__init__(data, data_model, t, config, val_data)
+        super().__init__(data, model, t, config, val_data)
 
         self.param_model = param_model
-        self.data_model = self.model
+        self.model = self.model
 
         # q(θ_k).
-        self.q = q_loc
+        self.q = qtheta
 
     def update_q(self, q, init_q=None):
         """
@@ -714,12 +745,12 @@ class HPVIClientIndependent(Client):
         """
 
         # Find new local approximate posterior.
-        q_loc = self.local_gradient_based_update(q_glob=q)
+        qtheta = self.local_gradient_based_update(q_glob=q)
 
         # Find new global contribution.
         q_new, self.t = self.gradient_based_update(p=q, init_q=init_q)
 
-        self.q = q_loc
+        self.q = qtheta
 
         # Only return new q and approximate likelihood term. Server doesn't
         # need to know about local model.
@@ -752,12 +783,12 @@ class HPVIClientIndependent(Client):
 
         if self.q is None:
             # Initialise to q(ɸ).
-            q_loc = q_glob.trainable_copy()
+            qtheta = q_glob.trainable_copy()
         else:
-            q_loc = self.q.trainable_copy()
+            qtheta = self.q.trainable_copy()
 
         # Parameters are those of q(θ).
-        parameters = q_loc.parameters()
+        parameters = qtheta.parameters()
 
         # Reset optimiser.
         logging.info("Resetting optimiser")
@@ -787,7 +818,7 @@ class HPVIClientIndependent(Client):
         performance_metrics = defaultdict(list)
 
         # Reset early stopping.
-        self.config["early_stopping"](None, q_loc.non_trainable_copy())
+        self.config["early_stopping"](None, qtheta.non_trainable_copy())
 
         # Gradient-based optimisation loop -- loop over epochs.
         epoch_iter = tqdm(
@@ -815,12 +846,12 @@ class HPVIClientIndependent(Client):
 
                 # Compute the KL divergence between q(θ) and p(θ), ignoring
                 # A(η_0).
-                kl = q_loc.kl_divergence(p_loc, calc_log_ap=False).sum()
+                kl = qtheta.kl_divergence(p_loc, calc_log_ap=False).sum()
                 kl /= len(x)
 
                 # Sample θ from q(θ) and compute p(y | θ) for each θ
-                ll = self.data_model.expected_log_likelihood(
-                    batch, q_loc, self.config["num_elbo_samples"]
+                ll = self.model.expected_log_likelihood(
+                    batch, qtheta, self.config["num_elbo_samples"]
                 ).sum()
                 ll /= len(x_batch)
 
@@ -842,7 +873,7 @@ class HPVIClientIndependent(Client):
 
             # Check whether to stop early.
             stop_early = self.config["early_stopping"](
-                training_metrics, q_loc.non_trainable_copy()
+                training_metrics, qtheta.non_trainable_copy()
             )
 
             if (
@@ -851,7 +882,7 @@ class HPVIClientIndependent(Client):
                 or stop_early
             ):
                 # Update global posterior before evaluating performance.
-                self.q = q_loc.non_trainable_copy()
+                self.q = qtheta.non_trainable_copy()
 
                 metrics = self.evaluate_performance(
                     {
@@ -888,11 +919,11 @@ class HPVIClientIndependent(Client):
 
         # Create non-trainable copy to send back to server.
         if self.config["early_stopping"].stash_model:
-            q_loc_new = self.config["early_stopping"].best_model
+            qtheta_new = self.config["early_stopping"].best_model
         else:
-            q_loc_new = q_loc.non_trainable_copy()
+            qtheta_new = qtheta.non_trainable_copy()
 
         # Finished optimisation, can now update.
         self._can_update = True
 
-        return q_loc_new
+        return qtheta_new

@@ -5,7 +5,7 @@ import ray
 
 from tqdm.auto import tqdm
 from pvi.servers import update_client
-from hpvi.servers import HPVIServer, HPVIServerBayesianHypers
+from hpvi.servers import HPVIServer, MFHPVIServer, HPVIServerBayesianHypers
 
 
 class HPVIAsynchronousRayFactory(HPVIServer):
@@ -185,6 +185,108 @@ class HPVISynchronousRayFactory(HPVIServer):
                         k,
                         metrics[f"q_{k}_server"][f"client_{k}_val_data"]["mll"],
                         metrics[f"q_{k}_server"][f"client_{k}_val_data"]["acc"],
+                    )
+                )
+
+    def should_stop(self):
+        iter_test = self.iterations > self.config["max_iterations"] - 1
+
+        if len(self.log["performance_metrics"]) > 0:
+            perf_test = (
+                self.log["performance_metrics"][-1]["q_server"]["val_data"]["mll"] < -10
+            )
+        else:
+            perf_test = False
+
+        return iter_test or perf_test
+
+
+class MFHPVISynchronousRayFactory(MFHPVIServer):
+    """
+    Acts as both the server and clients to enable scalable distributed
+    learning
+    """
+
+    def get_default_config(self):
+        return {
+            **super().get_default_config(),
+            "init_q_always": False,
+            "ray_options": {
+                "num_cpus": 0.1,
+                "num_gpus": 0,
+            },
+        }
+
+    def tick(self):
+
+        if self.t0 is None:
+            self.t0 = time.time()
+            self.pc0 = time.perf_counter()
+            self.pt0 = time.process_time()
+
+        while not self.should_stop():
+            # Pass current q to clients.
+            if self.iterations == 0 or self.config["init_q_always"]:
+                working_clients = [
+                    update_client.options(**self.config["ray_options"]).remote(
+                        client, self.qphi, self.init_q, i
+                    )
+                    for i, client in enumerate(self.clients)
+                ]
+            else:
+                working_clients = [
+                    update_client.options(**self.config["ray_options"]).remote(
+                        client, self.qphi, client_idx=i
+                    )
+                    for i, client in enumerate(self.clients)
+                ]
+
+            # Update stored clients.
+            for i, working_client in enumerate(working_clients):
+                self.clients[i] = ray.get(working_client)[0]
+
+            # Update global posterior.
+            self.compute_marginal()
+
+            self.communications += 1
+            self.iterations += 1
+
+            # Evaluate current posterior.
+            self.evaluate_performance()
+            self.log["communications"].append(self.communications)
+
+            metrics = self.log["performance_metrics"][-1]
+            print(f"Communications: {self.communications}.")
+            print("\nServer performance:")
+            print(
+                "Test mll: {:.3f}. Test acc: {:.3f}.".format(
+                    metrics["q_server"]["val_data"]["mll"],
+                    metrics["q_server"]["val_data"]["acc"],
+                )
+            )
+            for k in range(len(self.clients)):
+                print(
+                    "Client {}. Test mll: {:.3f}. Test acc: {:.3f}.".format(
+                        k,
+                        metrics["q_server"][f"client_{k}_val_data"]["mll"],
+                        metrics["q_server"][f"client_{k}_val_data"]["acc"],
+                    )
+                )
+
+            for k in range(len(self.clients)):
+                print(f"\nClient {k} performance:")
+                print(
+                    "Test mll: {:.3f}. Test acc: {:.3f}.".format(
+                        metrics[f"q_{k}_client"]["val_data"]["mll"],
+                        metrics[f"q_{k}_client"]["val_data"]["acc"],
+                    )
+                )
+
+                print(
+                    "Client {}. Test mll: {:.3f}. Test acc: {:.3f}.".format(
+                        k,
+                        metrics[f"q_{k}_client"][f"client_{k}_val_data"]["mll"],
+                        metrics[f"q_{k}_client"][f"client_{k}_val_data"]["acc"],
                     )
                 )
 
