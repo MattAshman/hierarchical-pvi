@@ -192,3 +192,126 @@ class HPVIServer(Server):
 
         else:
             return ValueError("Must specifiy either glob, loc or client_idx")
+
+
+class HPVIServerBayesianHypers(Server):
+    def __init__(self, param_model, pa, clients_val_data=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.param_model = param_model
+        self.clients_val_data = clients_val_data
+
+        # Prior over hyperparameters p(𝛼).
+        self.pa = pa
+
+        # Initialise.
+        self.qa = pa.non_trainable_copy()
+        self.q = self.p.non_trainable_copy()
+        self.q_glob = self.p.non_trainable_copy()
+
+        # Global posteriors q(ɸ), q(θ) and q(𝛼).
+        self.compute_marginals()
+
+
+    def evaluate_performance(self, default_metrics=None):
+        metrics = {
+            "time": time.time() - self.t0,
+            "perf_counter": time.perf_counter() - self.pc0,
+            "process_time": time.process_time() - self.pt0,
+            "communications": self.communications,
+            "iterations": self.iterations,
+        }
+
+        if default_metrics is not None:
+            metrics = {**default_metrics, **metrics}
+
+        if self.config["performance_metrics"] is not None:
+            perf_metrics = defaultdict(dict)
+
+            train_metrics = self.config["performance_metrics"](
+                self, self.data, q=self.q
+            )
+            perf_metrics["q_server"]["train_data"] = train_metrics
+
+            if self.val_data is not None:
+                # First get q_server performance on val data.
+                val_metrics = self.config["performance_metrics"](
+                    self, self.val_data, q=self.q
+                )
+
+                perf_metrics["q_server"]["val_data"] = val_metrics
+
+                # Now get each client's q_loc performance.
+                for i, client in enumerate(self.clients):
+                    q_i_client = client.q
+                    val_metrics = self.config["performance_metrics"](
+                        self, self.val_data, q=q_i_client
+                    )
+                    perf_metrics[f"q_{i}_client"]["val_data"] = val_metrics
+
+            if self.clients_val_data is not None:
+                # Get performance on local validation data.
+                for i, (client, val_data) in enumerate(
+                    zip(self.clients, self.clients_val_data)
+                ):
+                    val_metrics = self.config["performance_metrics"](
+                        self, val_data, q=self.q
+                    )
+                    perf_metrics["q_server"][f"client_{i}_val_data"] = val_metrics
+
+                    q_i_client = client.q
+                    val_metrics = self.config["performance_metrics"](
+                        self, val_data, q=q_i_client
+                    )
+                    perf_metrics[f"q_{i}_client"][f"client_{i}_val_data"] = val_metrics
+
+            metrics = {**metrics, **perf_metrics}
+
+        if self.config["track_q"]:
+            # Store current q(ɸ) natural parameters.
+            metrics["npq_phi"] = {
+                k: v.detach().cpu() for k, v in self.q_glob.nat_params.items()
+            }
+            metrics["npq_theta"] = {
+                k: v.detach().cpu() for k, v in self.q.nat_params.items()
+            }
+
+        self.log["performance_metrics"].append(metrics)
+
+        # Reset timers.
+        self.t0 = time.time()
+        self.pc0 = time.perf_counter()
+        self.pt0 = time.process_time()
+
+    def compute_marginals(self):
+        """
+        Computes the marginal distibution over local parameters θ* or global
+        parameters ɸ.
+        """
+        # q(𝛼) = p(𝛼) Π_m t_m(𝛼).
+        qa = self.pa.non_trainable_copy()
+        qphi = self.p.non_trainable_copy()
+
+        for client in self.clients:
+            # t(ɸ_m).
+            qa.replace_factor(None, client.ta)
+            qphi.replace_factor(None, client.t)
+
+        self.qa = qa
+        self.qphi = qphi
+
+        # q(θ) = ∫p(θ|ɸ)q(ɸ)dɸ. 
+        q = self.qphi.non_trainable_copy()
+        q_nps = q.nat_params
+        q_np1, q_np2 = q_nps["np1"], q_nps["np2"]
+
+        q_var = -0.5 / q_np2
+        q_loc = -0.5 * q_np1 / q_np2
+
+        q_var = q_var + self.param_model.outputsigma ** 2
+        q_loc = q_loc
+        q_np1 = q_loc * q_var ** -1
+        q_np2 = -0.5 * q_var ** -1
+        q_nps = {"np1": q_np1, "np2": q_np2}
+
+        self.q = self.q.create_new(nat_params=q_nps, is_trainable=False)

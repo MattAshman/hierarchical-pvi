@@ -73,6 +73,15 @@ class HPVIClientBayesianHypers(Client):
         # t(𝛼).
         self.ta = ta
 
+    def get_default_config(self):
+        return {
+            **super().get_default_config(),
+            "num_elbo_hyper_samples": 1,
+        }
+
+    def fit(self, qphi, qa, init_qphi=None, init_qtheta=None):
+        return self.update_q(qphi, qa, init_qphi, init_qtheta)
+
     def update_q(self, qphi, qa, init_qphi=None, init_qtheta=None):
         """
         Computes a refined approximate posterior and the associated
@@ -97,14 +106,10 @@ class HPVIClientBayesianHypers(Client):
         qa_cav = pa.non_trainable_copy()
 
         if self.t is not None:
-            qphi_cav.nat_params = {
-                k: v - self.t.nat_params[k] for k, v in qphi_cav.nat_params.items()
-            }
+            qphi_cav = qphi_cav.replace_factor(self.t, None)
 
         if self.ta is not None:
-            qa_cav.nat_params = {
-                k: v - self.ta.nat_params[k] for k, v in qa_cav.nat_params.items()
-            }
+            qa_cav = qa_cav.replace_factor(self.ta, None)
 
         if init_qphi is not None:
             qphi = init_qphi.trainable_copy()
@@ -117,8 +122,12 @@ class HPVIClientBayesianHypers(Client):
         if init_qtheta is not None:
             qtheta = init_qtheta.trainable_copy()
         else:
-            # Initialise to previous q(θ).
-            qtheta = self.q.trainable_copy()
+            if self.q is None:
+                # Initialise to q(ɸ).
+                qtheta = qphi.trainable_copy()
+            else:
+                # Initialise to previous q(θ).
+                qtheta = self.q.trainable_copy()
 
         qphi_parameters = list(qphi.parameters())
         qa_parameters = list(qa.parameters())
@@ -201,8 +210,8 @@ class HPVIClientBayesianHypers(Client):
                 }
 
                 # Compute the KL divergences.
-                klphi = qphi.kl_divergence(qphi_cav, calc_log_ap=False).sum() / len(x)
-                kla = qa.kl_divergence(qa_cav, calc_log_ap=False).sum() / len(x)
+                klphi = qphi.kl_divergence(qphi_cav).sum() / len(x)
+                kla = sum(qa.kl_divergence(qa_cav).values()) / len(x)
 
                 # Now to estimate E_{q(ɸ)q(𝛼)}[KL(q(θ)||p(θ|ɸ,𝛼))].
                 kltheta = 0
@@ -240,7 +249,7 @@ class HPVIClientBayesianHypers(Client):
                 kltheta /= len(x) * self.config["num_elbo_hyper_samples"]
 
                 # Sample θ from q(θ) and compute p(y | θ, x) for each θ
-                ll = self.data_model.expected_log_likelihood(
+                ll = self.model.expected_log_likelihood(
                     batch, qtheta, self.config["num_elbo_samples"]
                 ).sum()
                 ll /= len(x_batch)
